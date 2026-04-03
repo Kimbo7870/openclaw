@@ -6,6 +6,7 @@ import {
   registerCronListCommand,
   registerCronStatusCommand,
 } from "./register.cron-add.js";
+import { registerCronBulkAddCommand } from "./register.cron-bulk.js";
 import { registerCronEditCommand } from "./register.cron-edit.js";
 import { registerCronSimpleCommands } from "./register.cron-simple.js";
 
@@ -22,6 +23,7 @@ export function registerCronCli(program: Command) {
   registerCronStatusCommand(cron);
   registerCronListCommand(cron);
   registerCronAddCommand(cron);
+  registerCronBulkAddCommand(cron);
   registerCronSimpleCommands(cron);
   registerCronEditCommand(cron);
 }

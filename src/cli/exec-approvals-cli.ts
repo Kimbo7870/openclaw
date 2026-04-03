@@ -12,6 +12,7 @@ import {
   type ExecApprovalsAgent,
   type ExecApprovalsFile,
 } from "../infra/exec-approvals.js";
+import { resolveExecutablePath } from "../infra/executable-path.js";
 import { formatTimeAgo } from "../infra/format-time/format-relative.ts";
 import { defaultRuntime } from "../runtime.js";
 import { formatDocsLink } from "../terminal/links.js";
@@ -595,4 +596,318 @@ export function registerExecApprovalsCli(program: Command) {
       return true;
     },
   });
+
+  const removeAllCmd = allowlist
+    .command("remove-all")
+    .alias("rm-all")
+    .alias("delete-all")
+    .description("Remove every allowlist entry (optionally scoped to one agent)")
+    .option("--node <node>", "Target node id/name/IP")
+    .option("--gateway", "Force gateway approvals", false)
+    .option("--agent <id>", "Limit to a single agent id (defaults to all agents)")
+    .action(async (opts: ExecApprovalsCliOpts) => {
+      try {
+        const { snapshot, nodeId, source, targetLabel, baseHash } =
+          await loadWritableSnapshotTarget(opts);
+        const file = snapshot.file ?? { version: 1 };
+        file.version = 1;
+        const agents = file.agents ?? {};
+
+        const targetAgentKey =
+          typeof opts.agent === "string" && opts.agent.trim() ? opts.agent.trim() : null;
+        const agentKeys = targetAgentKey
+          ? Object.keys(agents).includes(targetAgentKey)
+            ? [targetAgentKey]
+            : []
+          : Object.keys(agents);
+
+        let removedCount = 0;
+        const nextAgents: Record<string, ExecApprovalsAgent> = { ...agents };
+        for (const agentKey of agentKeys) {
+          const agent = nextAgents[agentKey];
+          if (!agent) {
+            continue;
+          }
+          const allowlistEntries = Array.isArray(agent.allowlist) ? agent.allowlist : [];
+          if (allowlistEntries.length === 0) {
+            continue;
+          }
+          removedCount += allowlistEntries.length;
+          delete agent.allowlist;
+          if (isEmptyAgent(agent)) {
+            delete nextAgents[agentKey];
+          } else {
+            nextAgents[agentKey] = agent;
+          }
+        }
+
+        if (removedCount === 0) {
+          if (opts.json) {
+            defaultRuntime.writeJson({ removed: 0, target: targetLabel }, 0);
+          } else {
+            defaultRuntime.log("No allowlist entries to remove.");
+          }
+          return;
+        }
+
+        file.agents = Object.keys(nextAgents).length > 0 ? nextAgents : undefined;
+        await saveSnapshotTargeted({ opts, source, nodeId, file, baseHash, targetLabel });
+        if (!opts.json) {
+          const scope = targetAgentKey ? ` for agent ${targetAgentKey}` : "";
+          defaultRuntime.log(`Removed ${removedCount} allowlist entry(ies)${scope}.`);
+        }
+      } catch (err) {
+        defaultRuntime.error(formatCliError(err));
+        defaultRuntime.exit(1);
+      }
+    });
+  nodesCallOpts(removeAllCmd);
+
+  type BulkResolution =
+    | { ok: true; name: string; path: string }
+    | { ok: false; name: string; error: string };
+
+  const resolveExecNames = (names: string[]): BulkResolution[] => {
+    const seenPaths = new Set<string>();
+    const results: BulkResolution[] = [];
+    for (const raw of names) {
+      const name = raw.trim();
+      if (!name) {
+        continue;
+      }
+      const resolved = resolveExecutablePath(name);
+      if (!resolved) {
+        results.push({ ok: false, name, error: "not found on PATH" });
+        continue;
+      }
+      if (seenPaths.has(resolved)) {
+        // Skip duplicates resolved to the same binary so the summary stays accurate.
+        continue;
+      }
+      seenPaths.add(resolved);
+      results.push({ ok: true, name, path: resolved });
+    }
+    return results;
+  };
+
+  type BulkOutcome = {
+    name: string;
+    path: string;
+    status: "added" | "already" | "removed" | "missing";
+  };
+
+  const printBulkSummary = (params: {
+    json: boolean | undefined;
+    targetLabel: string;
+    action: "added" | "removed";
+    resolutions: BulkResolution[];
+    outcomes: BulkOutcome[];
+  }) => {
+    const successCount = params.outcomes.filter((o) =>
+      params.action === "added" ? o.status === "added" : o.status === "removed",
+    ).length;
+    const failures = params.resolutions.filter(
+      (r): r is Extract<BulkResolution, { ok: false }> => !r.ok,
+    );
+    if (params.json) {
+      defaultRuntime.writeJson(
+        {
+          ok: failures.length === 0,
+          target: params.targetLabel,
+          action: params.action,
+          succeeded: successCount,
+          outcomes: params.outcomes,
+          unresolved: failures,
+        },
+        0,
+      );
+      return;
+    }
+    const verb = params.action === "added" ? "Added" : "Removed";
+    defaultRuntime.log(
+      `${verb} ${successCount} of ${params.resolutions.length} command(s) on ${params.targetLabel}.`,
+    );
+    for (const o of params.outcomes) {
+      defaultRuntime.log(`  ${o.name} -> ${o.path} (${o.status})`);
+    }
+    for (const f of failures) {
+      defaultRuntime.error(`  ${f.name}: ${f.error}`);
+    }
+  };
+
+  const addBulkCmd = allowlist
+    .command("add-bulk")
+    .alias("bulk-add")
+    .description(
+      "Resolve each exec command name on PATH and add the absolute path to the allowlist",
+    )
+    .argument("<names...>", "Exec command names (e.g. python3 ls grep cat sed)")
+    .option("--node <node>", "Target node id/name/IP")
+    .option("--gateway", "Force gateway approvals", false)
+    .option("--agent <id>", 'Agent id (defaults to "*")')
+    .action(async (names: string[], opts: ExecApprovalsCliOpts) => {
+      try {
+        const resolutions = resolveExecNames(names);
+        const successes = resolutions.filter(
+          (r): r is Extract<BulkResolution, { ok: true }> => r.ok,
+        );
+        if (successes.length === 0) {
+          if (opts.json) {
+            defaultRuntime.writeJson(
+              { ok: false, action: "added", succeeded: 0, outcomes: [], unresolved: resolutions },
+              0,
+            );
+          } else {
+            defaultRuntime.error("No exec commands resolved on PATH; nothing to add.");
+            for (const r of resolutions) {
+              if (!r.ok) {
+                defaultRuntime.error(`  ${r.name}: ${r.error}`);
+              }
+            }
+          }
+          defaultRuntime.exit(1);
+          return;
+        }
+        const ctx = await loadWritableAllowlistAgent(opts);
+        const existing = new Set(
+          ctx.allowlistEntries
+            .map((entry) => normalizeAllowlistEntry(entry))
+            .filter((p): p is string => Boolean(p)),
+        );
+        const outcomes: BulkOutcome[] = [];
+        let mutated = false;
+        const now = Date.now();
+        for (const r of successes) {
+          if (existing.has(r.path)) {
+            outcomes.push({ name: r.name, path: r.path, status: "already" });
+            continue;
+          }
+          ctx.allowlistEntries.push({ pattern: r.path, lastUsedAt: now });
+          existing.add(r.path);
+          outcomes.push({ name: r.name, path: r.path, status: "added" });
+          mutated = true;
+        }
+        if (mutated) {
+          ctx.agent.allowlist = ctx.allowlistEntries;
+          ctx.file.agents = { ...ctx.file.agents, [ctx.agentKey]: ctx.agent };
+          await saveSnapshotTargeted({
+            opts,
+            source: ctx.source,
+            nodeId: ctx.nodeId,
+            file: ctx.file,
+            baseHash: ctx.baseHash,
+            targetLabel: ctx.targetLabel,
+          });
+        }
+        printBulkSummary({
+          json: opts.json,
+          targetLabel: ctx.targetLabel,
+          action: "added",
+          resolutions,
+          outcomes,
+        });
+        if (resolutions.some((r) => !r.ok)) {
+          defaultRuntime.exit(1);
+        }
+      } catch (err) {
+        defaultRuntime.error(formatCliError(err));
+        defaultRuntime.exit(1);
+      }
+    });
+  nodesCallOpts(addBulkCmd);
+
+  const removeBulkCmd = allowlist
+    .command("remove-bulk")
+    .alias("bulk-remove")
+    .alias("rm-bulk")
+    .description(
+      "Resolve each exec command name on PATH and remove the absolute path from the allowlist",
+    )
+    .argument("<names...>", "Exec command names (e.g. python3 ls grep cat sed)")
+    .option("--node <node>", "Target node id/name/IP")
+    .option("--gateway", "Force gateway approvals", false)
+    .option("--agent <id>", 'Agent id (defaults to "*")')
+    .action(async (names: string[], opts: ExecApprovalsCliOpts) => {
+      try {
+        const resolutions = resolveExecNames(names);
+        const successes = resolutions.filter(
+          (r): r is Extract<BulkResolution, { ok: true }> => r.ok,
+        );
+        if (successes.length === 0) {
+          if (opts.json) {
+            defaultRuntime.writeJson(
+              { ok: false, action: "removed", succeeded: 0, outcomes: [], unresolved: resolutions },
+              0,
+            );
+          } else {
+            defaultRuntime.error("No exec commands resolved on PATH; nothing to remove.");
+            for (const r of resolutions) {
+              if (!r.ok) {
+                defaultRuntime.error(`  ${r.name}: ${r.error}`);
+              }
+            }
+          }
+          defaultRuntime.exit(1);
+          return;
+        }
+        const ctx = await loadWritableAllowlistAgent(opts);
+        const removeSet = new Set(successes.map((r) => r.path));
+        const outcomes: BulkOutcome[] = [];
+        const nextEntries = ctx.allowlistEntries.filter((entry) => {
+          const pattern = normalizeAllowlistEntry(entry);
+          return !(pattern && removeSet.has(pattern));
+        });
+        const removed = ctx.allowlistEntries.length - nextEntries.length;
+        const removedPaths = new Set<string>();
+        for (const entry of ctx.allowlistEntries) {
+          const pattern = normalizeAllowlistEntry(entry);
+          if (pattern && removeSet.has(pattern)) {
+            removedPaths.add(pattern);
+          }
+        }
+        for (const r of successes) {
+          outcomes.push({
+            name: r.name,
+            path: r.path,
+            status: removedPaths.has(r.path) ? "removed" : "missing",
+          });
+        }
+        if (removed > 0) {
+          if (nextEntries.length === 0) {
+            delete ctx.agent.allowlist;
+          } else {
+            ctx.agent.allowlist = nextEntries;
+          }
+          if (isEmptyAgent(ctx.agent)) {
+            const agents = { ...ctx.file.agents };
+            delete agents[ctx.agentKey];
+            ctx.file.agents = Object.keys(agents).length > 0 ? agents : undefined;
+          } else {
+            ctx.file.agents = { ...ctx.file.agents, [ctx.agentKey]: ctx.agent };
+          }
+          await saveSnapshotTargeted({
+            opts,
+            source: ctx.source,
+            nodeId: ctx.nodeId,
+            file: ctx.file,
+            baseHash: ctx.baseHash,
+            targetLabel: ctx.targetLabel,
+          });
+        }
+        printBulkSummary({
+          json: opts.json,
+          targetLabel: ctx.targetLabel,
+          action: "removed",
+          resolutions,
+          outcomes,
+        });
+        if (resolutions.some((r) => !r.ok)) {
+          defaultRuntime.exit(1);
+        }
+      } catch (err) {
+        defaultRuntime.error(formatCliError(err));
+        defaultRuntime.exit(1);
+      }
+    });
+  nodesCallOpts(removeBulkCmd);
 }

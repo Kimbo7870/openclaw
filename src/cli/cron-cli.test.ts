@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { Command } from "commander";
 import { describe, expect, it, vi } from "vitest";
 import { registerCronCli } from "./cron-cli.js";
@@ -862,5 +865,110 @@ describe("cron cli", () => {
     expect(patch?.patch?.failureAlert?.after).toBe(1);
     expect(patch?.patch?.failureAlert?.mode).toBe("webhook");
     expect(patch?.patch?.failureAlert?.accountId).toBe("bot-a");
+  });
+
+  it("removes every cron job via the client-side loop", async () => {
+    resetGatewayMock();
+    callGatewayFromCli.mockImplementation(async (method: string) => {
+      if (method === "cron.list") {
+        return { jobs: [{ id: "job-a" }, { id: "job-b" }] };
+      }
+      if (method === "cron.remove") {
+        return { removed: true };
+      }
+      return { ok: true };
+    });
+    const program = buildProgram();
+    await program.parseAsync(["cron", "remove-all", "--json"], { from: "user" });
+    const removeCalls = callGatewayFromCli.mock.calls.filter((call) => call[0] === "cron.remove");
+    expect(removeCalls.map((call) => call[2])).toEqual([{ id: "job-a" }, { id: "job-b" }]);
+  });
+
+  it("adds cron jobs in bulk from a JSON file", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cron-bulk-"));
+    try {
+      const file = path.join(dir, "crons.json");
+      await fs.writeFile(
+        file,
+        JSON.stringify([
+          {
+            name: "Job A",
+            cron: "0 10 * * *",
+            tz: "America/New_York",
+            session: "isolated",
+            message: "do A",
+            "no-deliver": true,
+          },
+          {
+            name: "Job B",
+            cron: "0 11 * * *",
+            tz: "America/New_York",
+            session: "isolated",
+            message: "do B",
+            announce: true,
+            channel: "discord",
+            to: "channel:abc",
+          },
+        ]),
+      );
+      await runCronCommand(["cron", "add-bulk", file, "--json"]);
+      const addCalls = callGatewayFromCli.mock.calls.filter((call) => call[0] === "cron.add");
+      expect(addCalls).toHaveLength(2);
+      const first = addCalls[0]?.[2] as {
+        name?: string;
+        schedule?: { kind?: string; expr?: string; tz?: string };
+        sessionTarget?: string;
+        delivery?: { mode?: string };
+      };
+      expect(first.name).toBe("Job A");
+      expect(first.schedule).toMatchObject({
+        kind: "cron",
+        expr: "0 10 * * *",
+        tz: "America/New_York",
+      });
+      expect(first.sessionTarget).toBe("isolated");
+      expect(first.delivery?.mode).toBe("none");
+      const second = addCalls[1]?.[2] as {
+        name?: string;
+        delivery?: { mode?: string; channel?: string; to?: string };
+      };
+      expect(second.name).toBe("Job B");
+      expect(second.delivery).toMatchObject({
+        mode: "announce",
+        channel: "discord",
+        to: "channel:abc",
+      });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports failures from cron add-bulk and exits non-zero", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cron-bulk-bad-"));
+    try {
+      const file = path.join(dir, "crons.json");
+      // Second entry is missing --message/--system-event so it will fail validation.
+      await fs.writeFile(
+        file,
+        JSON.stringify([
+          {
+            name: "Good",
+            cron: "0 10 * * *",
+            tz: "America/New_York",
+            session: "isolated",
+            message: "ok",
+            "no-deliver": true,
+          },
+          { name: "Bad", cron: "0 11 * * *", tz: "America/New_York", session: "isolated" },
+        ]),
+      );
+      await expect(runCronCommand(["cron", "add-bulk", file, "--json"])).rejects.toThrow(
+        "__exit__:1",
+      );
+      const addCalls = callGatewayFromCli.mock.calls.filter((call) => call[0] === "cron.add");
+      expect(addCalls).toHaveLength(1);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });

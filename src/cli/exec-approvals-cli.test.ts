@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as execApprovals from "../infra/exec-approvals.js";
 import type { ExecApprovalsFile } from "../infra/exec-approvals.js";
+import * as executablePath from "../infra/executable-path.js";
 import { registerExecApprovalsCli } from "./exec-approvals-cli.js";
 
 const mocks = vi.hoisted(() => {
@@ -100,6 +101,16 @@ vi.mock("../infra/exec-approvals.js", async () => {
     ...actual,
     readExecApprovalsSnapshot: () => localSnapshot,
     saveExecApprovals: vi.fn(),
+  };
+});
+
+vi.mock("../infra/executable-path.js", async () => {
+  const actual = await vi.importActual<typeof import("../infra/executable-path.js")>(
+    "../infra/executable-path.js",
+  );
+  return {
+    ...actual,
+    resolveExecutablePath: vi.fn(),
   };
 });
 
@@ -486,6 +497,125 @@ describe("exec approvals CLI", () => {
       expect.objectContaining({
         version: 1,
         agents: undefined,
+      }),
+    );
+    expect(runtimeErrors).toHaveLength(0);
+  });
+
+  it("removes every allowlist entry across agents and prunes empty agents", async () => {
+    localSnapshot.file = {
+      version: 1,
+      agents: {
+        "*": {
+          allowlist: [{ pattern: "/usr/bin/uname", lastUsedAt: 1 }],
+        },
+        runner: {
+          allowlist: [
+            { pattern: "/usr/bin/grep", lastUsedAt: 2 },
+            { pattern: "/usr/bin/sed", lastUsedAt: 3 },
+          ],
+        },
+      },
+    };
+
+    const saveExecApprovals = vi.mocked(execApprovals.saveExecApprovals);
+    saveExecApprovals.mockClear();
+
+    await runApprovalsCommand(["approvals", "allowlist", "remove-all", "--json"]);
+
+    expect(saveExecApprovals).toHaveBeenCalledTimes(1);
+    expect(saveExecApprovals).toHaveBeenCalledWith(
+      expect.objectContaining({
+        version: 1,
+        agents: undefined,
+      }),
+    );
+    expect(runtimeErrors).toHaveLength(0);
+  });
+
+  it("resolves names to absolute paths and adds them via add-bulk", async () => {
+    const saveExecApprovals = vi.mocked(execApprovals.saveExecApprovals);
+    saveExecApprovals.mockClear();
+    const resolveExecutablePath = vi.mocked(executablePath.resolveExecutablePath);
+    resolveExecutablePath.mockReset();
+    resolveExecutablePath.mockImplementation((name: string) => {
+      if (name === "grep") {
+        return "/usr/bin/grep";
+      }
+      if (name === "cat") {
+        return "/bin/cat";
+      }
+      if (name === "missing-tool") {
+        return undefined;
+      }
+      return undefined;
+    });
+
+    await expect(
+      runApprovalsCommand([
+        "approvals",
+        "allowlist",
+        "add-bulk",
+        "grep",
+        "cat",
+        "missing-tool",
+        "--json",
+      ]),
+    ).rejects.toThrow("__exit__:1");
+
+    expect(saveExecApprovals).toHaveBeenCalledTimes(1);
+    expect(saveExecApprovals).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agents: expect.objectContaining({
+          "*": expect.objectContaining({
+            allowlist: expect.arrayContaining([
+              expect.objectContaining({ pattern: "/usr/bin/grep" }),
+              expect.objectContaining({ pattern: "/bin/cat" }),
+            ]),
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("removes resolved paths via remove-bulk", async () => {
+    localSnapshot.file = {
+      version: 1,
+      agents: {
+        "*": {
+          allowlist: [
+            { pattern: "/usr/bin/grep", lastUsedAt: 1 },
+            { pattern: "/bin/cat", lastUsedAt: 2 },
+            { pattern: "/usr/bin/keep", lastUsedAt: 3 },
+          ],
+        },
+      },
+    };
+
+    const saveExecApprovals = vi.mocked(execApprovals.saveExecApprovals);
+    saveExecApprovals.mockClear();
+    const resolveExecutablePath = vi.mocked(executablePath.resolveExecutablePath);
+    resolveExecutablePath.mockReset();
+    resolveExecutablePath.mockImplementation((name: string) => {
+      if (name === "grep") {
+        return "/usr/bin/grep";
+      }
+      if (name === "cat") {
+        return "/bin/cat";
+      }
+      return undefined;
+    });
+
+    await runApprovalsCommand(["approvals", "allowlist", "remove-bulk", "grep", "cat", "--json"]);
+
+    expect(saveExecApprovals).toHaveBeenCalledTimes(1);
+    expect(saveExecApprovals).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agents: expect.objectContaining({
+          "*": expect.objectContaining({
+            allowlist: [expect.objectContaining({ pattern: "/usr/bin/keep" })],
+          }),
+        }),
       }),
     );
     expect(runtimeErrors).toHaveLength(0);

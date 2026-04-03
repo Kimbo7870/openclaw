@@ -1,4 +1,5 @@
 import type { Command } from "commander";
+import type { CronJob } from "../../cron/types.js";
 import { defaultRuntime } from "../../runtime.js";
 import { addGatewayClientOptions, callGatewayFromCli } from "../gateway-rpc.js";
 import { handleCronCliError, printCronJson, warnIfCronSchedulerDisabled } from "./shared.js";
@@ -42,6 +43,55 @@ export function registerCronSimpleCommands(cron: Command) {
         try {
           const res = await callGatewayFromCli("cron.remove", opts, { id });
           printCronJson(res);
+        } catch (err) {
+          handleCronCliError(err);
+        }
+      }),
+  );
+
+  addGatewayClientOptions(
+    cron
+      .command("remove-all")
+      .alias("rm-all")
+      .alias("delete-all")
+      .description("Remove all cron jobs")
+      .option("--json", "Output JSON", false)
+      .action(async (opts) => {
+        try {
+          const listRes = await callGatewayFromCli("cron.list", opts, {
+            includeDisabled: true,
+          });
+          const jobs = (listRes as { jobs?: CronJob[] } | null)?.jobs ?? [];
+          const removed: string[] = [];
+          const failed: Array<{ id: string; error: string }> = [];
+          for (const job of jobs) {
+            try {
+              const res = (await callGatewayFromCli("cron.remove", opts, { id: job.id })) as {
+                removed?: boolean;
+              } | null;
+              if (res?.removed) {
+                removed.push(job.id);
+              } else {
+                failed.push({ id: job.id, error: "not removed" });
+              }
+            } catch (err) {
+              failed.push({ id: job.id, error: String(err) });
+            }
+          }
+          const summary = { ok: failed.length === 0, total: jobs.length, removed, failed };
+          if (opts.json) {
+            printCronJson(summary);
+          } else if (jobs.length === 0) {
+            defaultRuntime.log("No cron jobs to remove.");
+          } else {
+            defaultRuntime.log(`Removed ${removed.length} of ${jobs.length} cron job(s).`);
+            for (const entry of failed) {
+              defaultRuntime.error(`failed to remove ${entry.id}: ${entry.error}`);
+            }
+          }
+          if (failed.length > 0) {
+            defaultRuntime.exit(1);
+          }
         } catch (err) {
           handleCronCliError(err);
         }
